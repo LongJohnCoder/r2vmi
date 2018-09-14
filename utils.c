@@ -182,6 +182,18 @@ status_t vmi_dtb_to_pid_extended_idle(vmi_instance_t vmi, addr_t dtb, vmi_pid_t 
     return VMI_SUCCESS;
 }
 
+static event_response_t cb_on_make_sstep(vmi_instance_t vmi, vmi_event_t *event)
+{
+    eprintf("%s\n", __func__);
+
+    if (!event || event->type != VMI_EVENT_SINGLESTEP) {
+        eprintf("ERROR (%s): invalid event encounted\n", __func__);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
 static event_response_t cb_on_sstep(vmi_instance_t vmi, vmi_event_t *event)
 {
     status_t status;
@@ -513,6 +525,81 @@ static event_response_t cb_on_sstep_until_userland(vmi_instance_t vmi, vmi_event
         interrupted = true;
     }
     return VMI_EVENT_RESPONSE_NONE;
+}
+
+bool make_single_step(vmi_instance_t vmi, vmi_event_t *orig_event, int vcpu_id, int nb_steps)
+{
+    vmi_event_t ss_event;
+    status_t status;
+
+    // clear orig event
+    status = vmi_clear_event(vmi, orig_event, NULL);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: fail to clear event\n", __func__);
+        return VMI_EVENT_RESPONSE_NONE;
+    }
+
+    // prepare single step
+    memset(&ss_event, 0, sizeof(vmi_event_t));
+    ss_event.version = VMI_EVENTS_VERSION;
+    ss_event.type = VMI_EVENT_SINGLESTEP;
+    ss_event.callback = cb_on_make_sstep;
+    ss_event.ss_event.enable = 1;
+
+    SET_VCPU_SINGLESTEP(ss_event.ss_event, vcpu_id);
+    // register event
+    status = vmi_register_event(vmi, &ss_event);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: registering single step event failed\n", __func__);
+        return false;
+    }
+
+    status = vmi_resume_vm(vmi);
+    if (VMI_FAILURE == status)
+    {
+        eprint("%s: fail to resume VM\n");
+        return false;
+    }
+
+    // listen
+    for (int counter = 1; counter <= nb_steps; counter++)
+    {
+        eprintf("%s: step %d, Listening on VMI events...(%d)\n", __func__, counter, vmi_are_events_pending(vmi));
+        status = vmi_events_listen(vmi, 1000);
+        if (VMI_FAILURE == status)
+        {
+            eprintf("%s: Listening failed\n", __func__);
+            return false;
+        }
+    }
+
+    // pause VM
+    status = vmi_pause_vm(vmi);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: fail to pause VM\n", __func__);
+        return false;
+    }
+
+    // clear singlestep
+    status = vmi_clear_event(vmi, &ss_event, NULL);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: fail to clear event\n", __func__);
+        return false;
+    }
+
+    // register again interrupt event
+    status = vmi_register_event(vmi, orig_event);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: registering event failed\n", __func__);
+        return false;
+    }
+
+    return true;
 }
 
 bool attach_new_process(RDebug *dbg)

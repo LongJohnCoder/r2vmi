@@ -15,6 +15,7 @@ extern RIOPlugin r_io_plugin_vmi; // forward declaration
 static void rio_vmi_destroy(RIOVmi *ptr)
 {
     printf("%s\n", __func__);
+    eprintf("%s: events pending: %d\n", __func__, vmi_are_events_pending(ptr->vmi));
     if (ptr)
     {
         if (ptr->vm_name)
@@ -66,6 +67,10 @@ static RIODesc *__open(RIO *io, const char *pathname, int flags, int mode) {
 
     rio_vmi->current_vcpu = -1;
     rio_vmi->attached = false;
+    rio_vmi->int3_need_sstep = false;
+    rio_vmi->int3_bp = NULL;
+    rio_vmi->int3_bp_item = NULL;
+    rio_vmi->int3_event = NULL;
     // init breakpoint ghastable
     rio_vmi->bp_events_table = g_hash_table_new(g_direct_hash, g_direct_equal);
     // URI has the following format: vmi://vm_name:pid

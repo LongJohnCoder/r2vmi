@@ -8,6 +8,9 @@
 // vmi_events_listen loop
 static bool interrupted = false;
 
+// fwd declaration
+static int __step_vmi(RIOVmi *rio_vmi);
+static RDebugReasonType __wait_vmi(RIOVmi *rio_vmi);
 
 //
 // callbacks
@@ -157,7 +160,7 @@ static event_response_t cb_on_int3(vmi_instance_t vmi, vmi_event_t *event){
     bp_event_data *event_data;
     char *proc_name = NULL;
 
-    printf("%s\n", __func__);
+    printf("%s: events pending: %d\n", __func__, vmi_are_events_pending(vmi));
 
     if(!event || event->type != VMI_EVENT_INTERRUPT || !event->data) {
         eprintf("ERROR (%s): invalid event encounted\n", __func__);
@@ -175,35 +178,32 @@ static event_response_t cb_on_int3(vmi_instance_t vmi, vmi_event_t *event){
     // TODO check list of breakpoints from r2
     event->interrupt_event.reinject = 0;
 
-    // our pid ?
-    if (event->x86_regs->cr3 == event_data->pid_cr3)
+    // our targeted process ?
+    if (event->x86_regs->cr3 != event_data->pid_cr3)
     {
-        // pause VM
-        status = vmi_pause_vm(vmi);
-        if (VMI_FAILURE == status)
-        {
-            eprintf("%s: Fail to pause vm\n", __func__);
-        }
-        // stop listen
-        interrupted = true;
+        eprintf("%s: wrong process: %s (0x%lx)\n", __func__, proc_name, event->x86_regs->cr3);
+        event_data->rio_vmi->int3_need_sstep = true;
+        event_data->rio_vmi->int3_bp = event_data->bp;
+        event_data->rio_vmi->int3_bp_item = event_data->bpitem;
+        event_data->rio_vmi->int3_event = event;
+
+
+
+//        event_data->rio_vmi->pid_cr3 = event->x86_regs->cr3;
+//        vmi_dtb_to_pid(vmi, event->x86_regs->cr3, &event_data->rio_vmi->pid);
+        interrupted = false;
     }
     else
     {
-        eprintf("%s: wrong cr3 (0x%lx) process: %s\n", __func__, event->x86_regs->cr3, proc_name);
-        eprintf("%s: write back original opcode\n", __func__);
-        // unset bp (rewrite original instruction)
-        r_bp_restore_one(event_data->bp, event_data->bpitem, false);
-        eprintf("%s: singlestep once\n", __func__);
-        // singlestep once
-        status = vmi_step_event(vmi, event, event->vcpu_id, 1, NULL);
-        if (VMI_FAILURE == status)
-        {
-            eprintf("fail to singlestep over int3\n");
-            return VMI_EVENT_RESPONSE_NONE;
-        }
-        eprintf("%s: restore breakpoint\n", __func__);
-        // restore breakpoint
-        r_bp_restore_one(event_data->bp, event_data->bpitem, true);
+        // stop listen
+        interrupted = true;
+    }
+
+    // pause VM
+    status = vmi_pause_vm(vmi);
+    if (VMI_FAILURE == status)
+    {
+        eprintf("%s: Fail to pause vm\n", __func__);
     }
 
     return VMI_EVENT_RESPONSE_NONE;
@@ -237,19 +237,14 @@ static void register_breakpoint(gpointer key, gpointer value, gpointer user_data
     }
 }
 
-
-//
-// R2 debug interface
-//
-static int __step(RDebug *dbg) {
-    RIODesc *desc = NULL;
-    RIOVmi *rio_vmi = NULL;
+// refactored to take the RIOVmi paramater,
+// in order to be called from cb_on_int3
+static int __step_vmi(RIOVmi *rio_vmi)
+{
     status_t status;
 
-    printf("%s\n", __func__);
+    eprintf("%s\n", __func__);
 
-    desc = dbg->iob.io->desc;
-    rio_vmi = desc->data;
     if (!rio_vmi)
     {
         eprintf("%s: Invalid RIOVmi\n", __func__);
@@ -266,6 +261,7 @@ static int __step(RDebug *dbg) {
     rio_vmi->sstep_event->type = VMI_EVENT_SINGLESTEP;
     rio_vmi->sstep_event->callback = cb_on_sstep;
     rio_vmi->sstep_event->ss_event.enable = 1;
+
     SET_VCPU_SINGLESTEP(rio_vmi->sstep_event->ss_event, rio_vmi->current_vcpu);
     status = vmi_register_event(rio_vmi->vmi, rio_vmi->sstep_event);
     if (status == VMI_FAILURE)
@@ -282,6 +278,106 @@ static int __step(RDebug *dbg) {
     }
 
     return true;
+}
+
+// refactored to take the RIOVmi paramater,
+// in order to be called from cb_on_int3
+static RDebugReasonType __wait_vmi(RIOVmi *rio_vmi)
+{
+    RDebugReasonType reason = R_DEBUG_REASON_UNKNOWN;
+    status_t status;
+    eprintf("%s\n", __func__);
+
+    if (!rio_vmi)
+    {
+        eprintf("%s: Invalid RIOVmi\n", __func__);
+        return reason;
+    }
+
+    interrupted = false;
+    while (!interrupted) {
+        eprintf("%s: Listen to VMI events...\n", __func__);
+        status = vmi_events_listen(rio_vmi->vmi, 1000);
+        if (status == VMI_FAILURE)
+        {
+            eprintf("%s: Fail to listen to events\n", __func__);
+            return reason;
+        }
+
+        if (rio_vmi->int3_need_sstep)
+        {
+            // vm is paused
+            eprintf("%s: write back original opcode\n", __func__);
+            // unset bp (rewrite original instruction)
+            r_bp_restore_one(rio_vmi->int3_bp, rio_vmi->int3_bp_item, false);
+            eprintf("%s: singlestep once\n", __func__);
+            // singlestep once
+            // clear rio_vmi int3 field to avoid falling here again
+            rio_vmi->int3_need_sstep = false;
+            make_single_step(rio_vmi->vmi, rio_vmi->int3_event, 0, 1);
+            eprintf("%s: restore breakpoint\n", __func__);
+            // restore breakpoint
+            r_bp_restore_one(rio_vmi->int3_bp, rio_vmi->int3_bp_item, true);
+
+            // continue
+            status = vmi_resume_vm(rio_vmi->vmi);
+            if (VMI_FAILURE == status)
+            {
+                eprintf("%s: fail to resume VM\n", __func__);
+                return reason;
+            }
+
+            rio_vmi->int3_bp = NULL;
+            rio_vmi->int3_bp_item = NULL;
+            rio_vmi->int3_event = NULL;
+        }
+    }
+
+    // clear event buffer if any
+    status = vmi_events_listen(rio_vmi->vmi, 0);
+    if (status == VMI_FAILURE)
+    {
+        eprintf("%s: fail to clear event buffer\n", __func__);
+        return reason;
+    }
+
+    // clear event if singlestep
+    // breakpoint events are cleared in __breakpoint if unset
+    // was it a single step ?
+    if (rio_vmi->sstep_event)
+    {
+        status = vmi_clear_event(rio_vmi->vmi, rio_vmi->sstep_event, NULL);
+        if (VMI_FAILURE == status)
+        {
+            eprintf("%s: Fail to clear event\n", __func__);
+            return reason;
+        }
+        free(rio_vmi->sstep_event);
+        rio_vmi->sstep_event = NULL;
+        // re-register all breakpoint events that we previously unregistered
+        g_hash_table_foreach(rio_vmi->bp_events_table, register_breakpoint, (gpointer) rio_vmi);
+    }
+
+    // invalidate attach_cr3
+    rio_vmi->pid_cr3 = 0;
+
+    return R_DEBUG_REASON_BREAKPOINT;
+}
+
+
+//
+// R2 debug interface
+//
+static int __step(RDebug *dbg) {
+    RIODesc *desc = NULL;
+    RIOVmi *rio_vmi = NULL;
+
+    eprintf("%s\n", __func__);
+
+    desc = dbg->iob.io->desc;
+    rio_vmi = desc->data;
+
+    return __step_vmi(rio_vmi);
 }
 
 
@@ -411,60 +507,14 @@ static RList* __threads(__attribute__((unused)) RDebug *dbg, __attribute__((unus
 }
 
 static RDebugReasonType __wait(RDebug *dbg, __attribute__((unused)) int pid) {
-    RDebugReasonType reason = R_DEBUG_REASON_UNKNOWN;
     RIODesc *desc = NULL;
     RIOVmi *rio_vmi = NULL;
-    status_t status;
     eprintf("%s\n", __func__);
 
     desc = dbg->iob.io->desc;
     rio_vmi = desc->data;
-    if (!rio_vmi)
-    {
-        eprintf("%s: Invalid RIOVmi\n", __func__);
-        return reason;
-    }
 
-    interrupted = false;
-    while (!interrupted) {
-        eprintf("%s: Listen to VMI events...\n", __func__);
-        status = vmi_events_listen(rio_vmi->vmi, 1000);
-        if (status == VMI_FAILURE)
-        {
-            eprintf("%s: Fail to listen to events\n", __func__);
-            return reason;
-        }
-    }
-
-    // clear event buffer if any
-    status = vmi_events_listen(rio_vmi->vmi, 0);
-    if (status == VMI_FAILURE)
-    {
-        eprintf("%s: fail to clear event buffer\n", __func__);
-        return reason;
-    }
-
-    // clear event if singlestep
-    // breakpoint events are cleared in __breakpoint if unset
-    // was it a single step ?
-    if (rio_vmi->sstep_event)
-    {
-        status = vmi_clear_event(rio_vmi->vmi, rio_vmi->sstep_event, NULL);
-        if (VMI_FAILURE == status)
-        {
-            eprintf("%s: Fail to clear event\n", __func__);
-            return reason;
-        }
-        free(rio_vmi->sstep_event);
-        rio_vmi->sstep_event = NULL;
-        // re-register all breakpoint events that we previously unregistered
-        g_hash_table_foreach(rio_vmi->bp_events_table, register_breakpoint, (gpointer) rio_vmi);
-    }
-
-    // invalidate attach_cr3
-    rio_vmi->pid_cr3 = 0;
-
-    return R_DEBUG_REASON_BREAKPOINT;
+    return __wait_vmi(rio_vmi);
 }
 
 // "dm" get memory maps of target process
@@ -645,6 +695,7 @@ static int __breakpoint (struct r_bp_t *bp, RBreakpointItem *b, bool set) {
             event_data->bp_vaddr = bp_vaddr;
             event_data->bp = bp;
             event_data->bpitem = b;
+            event_data->rio_vmi = rio_vmi;
             bp_event->data = event_data;
 
             // add our breakpoint to the hashtable
@@ -701,7 +752,7 @@ static int __breakpoint (struct r_bp_t *bp, RBreakpointItem *b, bool set) {
         else
         {
             eprintf("%s: Fail to find breakpoint in table\n", __func__);
-            return false;
+            return true;
         }
     }
 

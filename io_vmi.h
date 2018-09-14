@@ -25,6 +25,12 @@ typedef struct {
     // if we are attaching to a new process being created
     // or if the process is already existing
     bool attach_new_process;
+    // if you hit an int3, this will indicate if we need a singlestep
+    // because it's the wrong process
+    bool int3_need_sstep;
+    RBreakpoint *int3_bp;
+    RBreakpointItem *int3_bp_item;
+    vmi_event_t *int3_event;
 } RIOVmi;
 
 typedef struct
